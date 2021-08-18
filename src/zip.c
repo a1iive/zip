@@ -261,6 +261,10 @@ static mz_bool zip_name_match(const char *name1, const char *name2) {
   return res;
 }
 
+void *zip_decompress(const void *pSrc_buf, size_t src_buf_len, size_t *pOut_len, int flags) {
+  return tinfl_decompress_mem_to_heap(pSrc_buf, src_buf_len, pOut_len, flags);
+}
+
 static int zip_archive_truncate(mz_zip_archive *pzip) {
   mz_zip_internal_state *pState = pzip->m_pState;
   mz_uint64 file_size = pzip->m_archive_size;
@@ -848,6 +852,24 @@ void zip_close(struct zip_t *zip) {
   }
 }
 
+void zip_close_out(struct zip_t *zip, void *outBuf, size_t *outSize) {
+  if (zip) {
+    // Always finalize, even if adding failed for some reason, so we have a
+    // valid central directory.
+    mz_zip_archive *pZip = &(zip->archive);
+    pZip->tmp_outBuf = outBuf;
+    pZip->tmp_outSize = 0;
+    mz_zip_writer_finalize_archive(&(zip->archive));
+    *outSize = pZip->tmp_outSize;
+    pZip->tmp_outBuf = NULL;
+    zip_archive_truncate(&(zip->archive));
+    mz_zip_writer_end(&(zip->archive));
+    mz_zip_reader_end(&(zip->archive));
+
+    CLEANUP(zip);
+  }
+}
+
 int zip_is64(struct zip_t *zip) {
   if (!zip || !zip->archive.m_pState) {
     // zip_t handler or zip state is not initialized
@@ -985,6 +1007,169 @@ int zip_entry_open(struct zip_t *zip, const char *entryname) {
     err = ZIP_EWRTENT;
     goto cleanup;
   }
+
+  zip->entry.offset += entrylen;
+  level = zip->level & 0xF;
+  if (level) {
+    zip->entry.state.m_pZip = pzip;
+    zip->entry.state.m_cur_archive_file_ofs = zip->entry.offset;
+    zip->entry.state.m_comp_size = 0;
+
+    if (tdefl_init(&(zip->entry.comp), mz_zip_writer_add_put_buf_callback,
+                   &(zip->entry.state),
+                   (int)tdefl_create_comp_flags_from_zip_params(
+                       (int)level, -15, MZ_DEFAULT_STRATEGY)) !=
+        TDEFL_STATUS_OKAY) {
+      // Cannot initialize the zip compressor
+      err = ZIP_ETDEFLINIT;
+      goto cleanup;
+    }
+  }
+
+  zip->entry.m_time = time(NULL);
+
+  return 0;
+
+cleanup:
+  CLEANUP(zip->entry.name);
+  return err;
+}
+
+int zip_entry_open_out(struct zip_t *zip, const char *entryname, void *outBuf, size_t *outSize) {
+  size_t entrylen = 0;
+  mz_zip_archive *pzip = NULL;
+  mz_uint num_alignment_padding_bytes, level;
+  mz_zip_archive_file_stat stats;
+  int err = 0;
+
+  if (!zip) {
+    return ZIP_ENOINIT;
+  }
+
+  if (!entryname) {
+    return ZIP_EINVENTNAME;
+  }
+
+  entrylen = strlen(entryname);
+  if (entrylen == 0) {
+    return ZIP_EINVENTNAME;
+  }
+
+  /*
+    .ZIP File Format Specification Version: 6.3.3
+
+    4.4.17.1 The name of the file, with optional relative path.
+    The path stored MUST not contain a drive or
+    device letter, or a leading slash.  All slashes
+    MUST be forward slashes '/' as opposed to
+    backwards slashes '\' for compatibility with Amiga
+    and UNIX file systems etc.  If input came from standard
+    input, there is no file name field.
+  */
+  if (zip->entry.name) {
+    CLEANUP(zip->entry.name);
+  }
+  zip->entry.name = zip_strrpl(entryname, entrylen, '\\', '/');
+  if (!zip->entry.name) {
+    // Cannot parse zip entry name
+    return ZIP_EINVENTNAME;
+  }
+
+  pzip = &(zip->archive);
+  // start
+  pzip->tmp_outBuf = outBuf;
+  pzip->tmp_outSize = 0;
+
+  if (pzip->m_zip_mode == MZ_ZIP_MODE_READING) {
+    zip->entry.index =
+        mz_zip_reader_locate_file(pzip, zip->entry.name, NULL, 0);
+    if (zip->entry.index < 0) {
+      err = ZIP_ENOENT;
+      goto cleanup;
+    }
+
+    if (!mz_zip_reader_file_stat(pzip, (mz_uint)zip->entry.index, &stats)) {
+      err = ZIP_ENOENT;
+      goto cleanup;
+    }
+
+    zip->entry.comp_size = stats.m_comp_size;
+    zip->entry.uncomp_size = stats.m_uncomp_size;
+    zip->entry.uncomp_crc32 = stats.m_crc32;
+    zip->entry.offset = stats.m_central_dir_ofs;
+    zip->entry.header_offset = stats.m_local_header_ofs;
+    zip->entry.method = stats.m_method;
+    zip->entry.external_attr = stats.m_external_attr;
+#ifndef MINIZ_NO_TIME
+    zip->entry.m_time = stats.m_time;
+#endif
+
+    return 0;
+  }
+
+  zip->entry.index = (int)zip->archive.m_total_files;
+  zip->entry.comp_size = 0;
+  zip->entry.uncomp_size = 0;
+  zip->entry.uncomp_crc32 = MZ_CRC32_INIT;
+  zip->entry.offset = zip->archive.m_archive_size;
+  zip->entry.header_offset = zip->archive.m_archive_size;
+  memset(zip->entry.header, 0, MZ_ZIP_LOCAL_DIR_HEADER_SIZE * sizeof(mz_uint8));
+  zip->entry.method = 0;
+
+  // UNIX or APPLE
+#if MZ_PLATFORM == 3 || MZ_PLATFORM == 19
+  // regular file with rw-r--r-- persmissions
+  zip->entry.external_attr = (mz_uint32)(0100644) << 16;
+#else
+  zip->entry.external_attr = 0;
+#endif
+
+  num_alignment_padding_bytes =
+      mz_zip_writer_compute_padding_needed_for_file_alignment(pzip);
+
+  if (!pzip->m_pState || (pzip->m_zip_mode != MZ_ZIP_MODE_WRITING)) {
+    // Invalid zip mode
+    err = ZIP_EINVMODE;
+    goto cleanup;
+  }
+  if (zip->level & MZ_ZIP_FLAG_COMPRESSED_DATA) {
+    // Invalid zip compression level
+    err = ZIP_EINVLVL;
+    goto cleanup;
+  }
+  // no zip64 support yet
+  if ((pzip->m_total_files == 0xFFFF) ||
+      ((pzip->m_archive_size + num_alignment_padding_bytes +
+        MZ_ZIP_LOCAL_DIR_HEADER_SIZE + MZ_ZIP_CENTRAL_DIR_HEADER_SIZE +
+        entrylen) > 0xFFFFFFFF)) {
+    // No zip64 support yet
+    err = ZIP_ENOSUP64;
+    goto cleanup;
+  }
+  if (!mz_zip_writer_write_zeros(pzip, zip->entry.offset,
+                                 num_alignment_padding_bytes +
+                                     sizeof(zip->entry.header))) {
+    // Cannot memset zip entry header
+    err = ZIP_EMEMSET;
+    goto cleanup;
+  }
+
+  zip->entry.header_offset += num_alignment_padding_bytes;
+  if (pzip->m_file_offset_alignment) {
+    MZ_ASSERT(
+        (zip->entry.header_offset & (pzip->m_file_offset_alignment - 1)) == 0);
+  }
+  zip->entry.offset += num_alignment_padding_bytes + sizeof(zip->entry.header);
+
+  if (pzip->m_pWrite(pzip->m_pIO_opaque, zip->entry.offset, zip->entry.name,
+                     entrylen) != entrylen) {
+    // Cannot write data to zip entry
+    err = ZIP_EWRTENT;
+    goto cleanup;
+  }
+  // end
+  *outSize = pzip->tmp_outSize;
+  pzip->tmp_outBuf = NULL;
 
   zip->entry.offset += entrylen;
   level = zip->level & 0xF;
@@ -1167,6 +1352,125 @@ cleanup:
   return err;
 }
 
+int zip_entry_close_before(struct zip_t *zip, void *outBuf, size_t *outSize) {
+  mz_zip_archive *pzip = NULL;
+  mz_uint level;
+  tdefl_status done;
+  int err = 0;
+
+  if (!zip) {
+    // zip_t handler is not initialized
+    err = ZIP_ENOINIT;
+    goto cleanup;
+  }
+
+  pzip = &(zip->archive);
+
+  if (pzip->m_zip_mode == MZ_ZIP_MODE_READING) {
+    goto cleanup;
+  }
+
+  
+  
+  level = zip->level & 0xF;
+  if (level) {
+    //start
+    pzip->tmp_outBuf = outBuf;
+    pzip->tmp_outSize = 0;
+
+    done = tdefl_compress_buffer(&(zip->entry.comp), "", 0, TDEFL_FINISH);
+    if (done != TDEFL_STATUS_DONE && done != TDEFL_STATUS_OKAY) {
+      // Cannot flush compressed buffer
+      err = ZIP_ETDEFLBUF;
+      goto cleanup;
+    }
+    // end
+    *outSize = pzip->tmp_outSize;
+    pzip->tmp_outBuf = NULL;
+
+    zip->entry.comp_size = zip->entry.state.m_comp_size;
+    zip->entry.offset = zip->entry.state.m_cur_archive_file_ofs;
+    zip->entry.method = MZ_DEFLATED;
+  }
+
+cleanup:
+  return err;
+}
+
+int zip_entry_close_out(struct zip_t *zip, void *outBuf, size_t *outSize) {
+  mz_zip_archive *pzip = NULL;
+  mz_uint16 entrylen;
+  mz_uint16 dos_time = 0, dos_date = 0;
+  int err = 0;
+
+  if (!zip) {
+    // zip_t handler is not initialized
+    err = ZIP_ENOINIT;
+    goto cleanup;
+  }
+
+  pzip = &(zip->archive);
+
+  if (pzip->m_zip_mode == MZ_ZIP_MODE_READING) {
+    goto cleanup;
+  }
+
+  //start
+  pzip->tmp_outBuf = outBuf;
+  pzip->tmp_outSize = 0;
+
+  entrylen = (mz_uint16)strlen(zip->entry.name);
+  if ((zip->entry.comp_size > 0xFFFFFFFF) || (zip->entry.offset > 0xFFFFFFFF)) {
+    // No zip64 support, yet
+    err = ZIP_ENOSUP64;
+    goto cleanup;
+  }
+
+#ifndef MINIZ_NO_TIME
+  mz_zip_time_t_to_dos_time(zip->entry.m_time, &dos_time, &dos_date);
+#endif
+
+  if (!mz_zip_writer_create_local_dir_header(
+          pzip, zip->entry.header, entrylen, 0, zip->entry.uncomp_size,
+          zip->entry.comp_size, zip->entry.uncomp_crc32, zip->entry.method, 0,
+          dos_time, dos_date)) {
+    // Cannot create zip entry header
+    err = ZIP_ECRTHDR;
+    goto cleanup;
+  }
+  
+  if (pzip->m_pWrite(pzip->m_pIO_opaque, zip->entry.header_offset,
+                     zip->entry.header,
+                     sizeof(zip->entry.header)) != sizeof(zip->entry.header)) {
+    // Cannot write zip entry header
+    err = ZIP_EWRTHDR;
+    goto cleanup;
+  }
+
+  if (!mz_zip_writer_add_to_central_dir(
+          pzip, zip->entry.name, entrylen, NULL, 0, "", 0,
+          zip->entry.uncomp_size, zip->entry.comp_size, zip->entry.uncomp_crc32,
+          zip->entry.method, 0, dos_time, dos_date, zip->entry.header_offset,
+          zip->entry.external_attr, NULL, 0)) {
+    // Cannot write to zip central dir
+    err = ZIP_EWRTDIR;
+    goto cleanup;
+  }
+
+  // end
+  *outSize = pzip->tmp_outSize;
+  pzip->tmp_outBuf = NULL;
+  pzip->m_total_files++;
+  pzip->m_archive_size = zip->entry.offset;
+
+cleanup:
+  if (zip) {
+    zip->entry.m_time = 0;
+    CLEANUP(zip->entry.name);
+  }
+  return err;
+}
+
 const char *zip_entry_name(struct zip_t *zip) {
   if (!zip) {
     // zip_t handler is not initialized
@@ -1236,6 +1540,53 @@ int zip_entry_write(struct zip_t *zip, const void *buf, size_t bufsize) {
     } else {
       status = tdefl_compress_buffer(&(zip->entry.comp), buf, bufsize,
                                      TDEFL_NO_FLUSH);
+      if (status != TDEFL_STATUS_DONE && status != TDEFL_STATUS_OKAY) {
+        // Cannot compress buffer
+        return ZIP_ETDEFLBUF;
+      }
+    }
+  }
+
+  return 0;
+}
+
+int zip_entry_write_out(struct zip_t *zip, const void *inbuf, size_t inbufsize, 
+    void *outBuf, size_t *outSize) {
+  mz_uint level;
+  mz_zip_archive *pzip = NULL;
+  tdefl_status status;
+
+  if (!zip) {
+    // zip_t handler is not initialized
+    return ZIP_ENOINIT;
+  }
+
+  pzip = &(zip->archive);
+  // start 
+  pzip->tmp_outBuf = outBuf;
+  pzip->tmp_outSize = 0;
+
+  if (inbuf && inbufsize > 0) {
+    zip->entry.uncomp_size += inbufsize;
+    zip->entry.uncomp_crc32 = (mz_uint32)mz_crc32(
+        zip->entry.uncomp_crc32, (const mz_uint8 *)inbuf, inbufsize);
+
+    level = zip->level & 0xF;
+    if (!level) {
+      if ((pzip->m_pWrite(pzip->m_pIO_opaque, zip->entry.offset, inbuf,
+                          inbufsize) != inbufsize)) {
+        // Cannot write buffer
+        return ZIP_EWRTENT;
+      }
+      zip->entry.offset += inbufsize;
+      zip->entry.comp_size += inbufsize;
+    } else {
+      status = tdefl_compress_buffer(&(zip->entry.comp), inbuf, inbufsize, TDEFL_SYNC_FLUSH);
+
+      // end
+      *outSize = pzip->tmp_outSize;
+      pzip->tmp_outBuf = NULL;
+
       if (status != TDEFL_STATUS_DONE && status != TDEFL_STATUS_OKAY) {
         // Cannot compress buffer
         return ZIP_ETDEFLBUF;
@@ -1532,6 +1883,21 @@ ssize_t zip_stream_copy(struct zip_t *zip, void **buf, size_t *bufsize) {
 
 void zip_stream_close(struct zip_t *zip) {
   if (zip) {
+    mz_zip_writer_end(&(zip->archive));
+    mz_zip_reader_end(&(zip->archive));
+    CLEANUP(zip);
+  }
+}
+
+void zip_stream_close_out(struct zip_t *zip, void *outBuf, size_t *outSize) {
+  if (zip) {
+    mz_zip_archive *pZip = &(zip->archive);
+    pZip->tmp_outBuf = outBuf;
+    pZip->tmp_outSize = 0;
+    mz_zip_writer_finalize_archive(&(zip->archive));
+    *outSize = pZip->tmp_outSize;
+    pZip->tmp_outBuf = NULL;
+    zip_archive_truncate(&(zip->archive));
     mz_zip_writer_end(&(zip->archive));
     mz_zip_reader_end(&(zip->archive));
     CLEANUP(zip);

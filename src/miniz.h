@@ -1307,6 +1307,9 @@ typedef struct {
   mz_file_needs_keepalive m_pNeeds_keepalive;
   void *m_pIO_opaque;
 
+  void *tmp_outBuf;
+  size_t tmp_outSize;
+  
   mz_zip_internal_state *m_pState;
 
 } mz_zip_archive;
@@ -7630,16 +7633,22 @@ static size_t mz_zip_heap_write_func(void *pOpaque, mz_uint64 file_ofs,
     while (new_capacity < new_size)
       new_capacity *= 2;
 
-    if (NULL == (pNew_block = pZip->m_pRealloc(
-                     pZip->m_pAlloc_opaque, pState->m_pMem, 1, new_capacity))) {
-      mz_zip_set_error(pZip, MZ_ZIP_ALLOC_FAILED);
-      return 0;
-    }
+    // if (NULL == (pNew_block = pZip->m_pRealloc(
+    //                  pZip->m_pAlloc_opaque, pState->m_pMem, 1, new_capacity))) {
+    //   mz_zip_set_error(pZip, MZ_ZIP_ALLOC_FAILED);
+    //   return 0;
+    // }
 
-    pState->m_pMem = pNew_block;
+    // pState->m_pMem = pNew_block;
     pState->m_mem_capacity = new_capacity;
   }
-  memcpy((mz_uint8 *)pState->m_pMem + file_ofs, pBuf, n);
+
+  if (pZip->tmp_outBuf) {
+    memcpy((char*)(pZip->tmp_outBuf)+pZip->tmp_outSize, pBuf, n);
+    pZip->tmp_outSize += n;
+  }
+  
+  // memcpy((mz_uint8 *)pState->m_pMem + file_ofs, pBuf, n);
   pState->m_mem_size = (size_t)new_size;
   return n;
 }
@@ -7762,11 +7771,11 @@ mz_bool mz_zip_writer_init_heap_v2(mz_zip_archive *pZip,
 
   if (0 != (initial_allocation_size = MZ_MAX(initial_allocation_size,
                                              size_to_reserve_at_beginning))) {
-    if (NULL == (pZip->m_pState->m_pMem = pZip->m_pAlloc(
-                     pZip->m_pAlloc_opaque, 1, initial_allocation_size))) {
-      mz_zip_writer_end_internal(pZip, MZ_FALSE);
-      return mz_zip_set_error(pZip, MZ_ZIP_ALLOC_FAILED);
-    }
+    // if (NULL == (pZip->m_pState->m_pMem = pZip->m_pAlloc(
+    //                  pZip->m_pAlloc_opaque, 1, initial_allocation_size))) {
+    //   mz_zip_writer_end_internal(pZip, MZ_FALSE);
+    //   return mz_zip_set_error(pZip, MZ_ZIP_ALLOC_FAILED);
+    // }
     pZip->m_pState->m_mem_capacity = initial_allocation_size;
   }
 
@@ -7793,6 +7802,11 @@ static size_t mz_zip_file_write_func(void *pOpaque, mz_uint64 file_ofs,
        (MZ_FSEEK64(pZip->m_pState->m_pFile, (mz_int64)file_ofs, SEEK_SET)))) {
     mz_zip_set_error(pZip, MZ_ZIP_FILE_SEEK_FAILED);
     return 0;
+  }
+
+  if (pZip->tmp_outBuf) {
+    memcpy((char*)(pZip->tmp_outBuf)+pZip->tmp_outSize, pBuf, n);
+    pZip->tmp_outSize += n;
   }
 
   return MZ_FWRITE(pBuf, 1, n, pZip->m_pState->m_pFile);
